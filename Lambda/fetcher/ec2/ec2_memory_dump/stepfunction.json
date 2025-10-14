@@ -1,0 +1,114 @@
+{
+  "Comment": "DFIR: Dump-if-SSM, else no-op; output only instanceId per item",
+  "StartAt": "ProcessInstances",
+  "States": {
+    "ProcessInstances": {
+      "Type": "Map",
+      "ItemsPath": "$.instances",
+      "MaxConcurrency": 5,
+      "ResultPath": "$.perInstance",
+      "Iterator": {
+        "StartAt": "GetFacts",
+        "States": {
+          "GetFacts": {
+            "Type": "Task",
+            "Resource": "arn:aws:lambda:ap-northeast-2:032552344607:function:GetFacts",
+            "Parameters": {
+              "instanceId.$": "$.instanceId",
+              "region.$": "$.region",
+              "targetRoleArn.$": "$$.Execution.Input.targetRoleArn"
+            },
+            "ResultPath": "$.facts",
+            "Next": "SSMManaged?"
+          },
+          "SSMManaged?": {
+            "Type": "Choice",
+            "Choices": [
+              {
+                "Variable": "$.facts.ssmManaged",
+                "BooleanEquals": true,
+                "Next": "OSChoice"
+              }
+            ],
+            "Default": "EndItem"
+          },
+          "OSChoice": {
+            "Type": "Choice",
+            "Choices": [
+              {
+                "Variable": "$.facts.os",
+                "StringEquals": "windows",
+                "Next": "DumpWindows"
+              },
+              {
+                "Variable": "$.facts.os",
+                "StringEquals": "linux",
+                "Next": "DumpLinux"
+              }
+            ],
+            "Default": "EndItem"
+          },
+          "DumpWindows": {
+            "Type": "Task",
+            "Resource": "arn:aws:lambda:ap-northeast-2:032552344607:function:DumpWindows",
+            "Parameters": {
+              "instanceId.$": "$.instanceId",
+              "region.$": "$.region",
+              "incident_id.$": "$$.Execution.Input.incident_id",
+              "targetRoleArn.$": "$$.Execution.Input.targetRoleArn",
+              "dumpDir": "C:\\forensics"
+            },
+            "ResultPath": "$.dumpResult",
+            "Catch": [
+              {
+                "ErrorEquals": [
+                  "States.ALL"
+                ],
+                "ResultPath": "$.dumpError",
+                "Next": "EndItem"
+              }
+            ],
+            "Next": "EndItem"
+          },
+          "DumpLinux": {
+            "Type": "Task",
+            "Resource": "arn:aws:lambda:ap-northeast-2:032552344607:function:DumpLinux",
+            "Parameters": {
+              "instanceId.$": "$.instanceId",
+              "region.$": "$.region",
+              "incident_id.$": "$$.Execution.Input.incident_id",
+              "targetRoleArn.$": "$$.Execution.Input.targetRoleArn",
+              "dumpDir": "/forensics"
+            },
+            "ResultPath": "$.dumpResult",
+            "Catch": [
+              {
+                "ErrorEquals": [
+                  "States.ALL"
+                ],
+                "ResultPath": "$.dumpError",
+                "Next": "EndItem"
+              }
+            ],
+            "Next": "EndItem"
+          },
+          "EndItem": {
+            "Type": "Pass",
+            "OutputPath": "$",
+            "End": true
+          }
+        }
+      },
+      "Next": "Done"
+    },
+    "Done": {
+      "Type": "Pass",
+      "Parameters": {
+        "incident_id.$": "$.incident_id",
+        "instanceIds.$": "$.perInstance"
+      },
+      "End": true
+    }
+  },
+  "TimeoutSeconds": 3600
+}
