@@ -1,7 +1,5 @@
-
 import os
 import json
-import gzip
 import time
 import random
 import logging
@@ -136,29 +134,27 @@ def get_log_events(log_group_name: str, log_stream_name: str,
         params["nextToken"] = next_token
     return retry_call(logs_client.get_log_events, 5, 1, **params)
 
-# ===== S3 업로드 =====
+# ===== S3 업로드 (JSON 배열, 비압축) =====
 def upload_to_s3(data: List[Dict[str, Any]], log_group: str, log_stream: str, part_id: int):
-    """로그 이벤트를 JSONL.GZ 형식으로 S3에 업로드"""
+    """로그 이벤트를 JSON 배열(.json)로 S3에 업로드 (비압축)"""
     if not data:
         return
 
     encoded_group = quote(log_group, safe="")
     encoded_stream = quote(log_stream, safe="")
-    s3_key = f"{PREFIX}/region={AWS_REGION}/group={encoded_group}/stream={encoded_stream}/part-{part_id}.jsonl.gz"
+    s3_key = f"{PREFIX}/region={AWS_REGION}/group={encoded_group}/stream={encoded_stream}/part-{part_id}.json"
 
-    jsonl_content = "\n".join([json.dumps(e, ensure_ascii=False) for e in data])
-    compressed = gzip.compress(jsonl_content.encode("utf-8"))
+    json_bytes = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
 
     try:
         s3_client.put_object(
             Bucket=BUCKET,
             Key=s3_key,
-            Body=compressed,
-            ContentType="application/gzip",
-            ContentEncoding="gzip",
+            Body=json_bytes,
+            ContentType="application/json",
             ServerSideEncryption="AES256",
         )
-        logger.info(f"✓ Uploaded s3://{BUCKET}/{s3_key} ({len(data)} events, {len(compressed)} bytes)")
+        logger.info(f"✓ Uploaded s3://{BUCKET}/{s3_key} ({len(data)} events, {len(json_bytes)} bytes)")
     except ClientError as e:
         logger.error(f"✗ S3 upload failed for {s3_key}: {e}")
         raise
