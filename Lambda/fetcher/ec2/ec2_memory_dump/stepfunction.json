@@ -12,7 +12,7 @@
         "States": {
           "GetFacts": {
             "Type": "Task",
-            "Resource": "arn:aws:lambda:ap-northeast-2:032552344607:function:GetFacts",
+            "Resource": "arn:aws:lambda:ap-northeast-2:{AccountB_id}:function:GetFacts",
             "Parameters": {
               "instanceId.$": "$.instanceId",
               "region.$": "$.region",
@@ -50,7 +50,7 @@
           },
           "DumpWindows": {
             "Type": "Task",
-            "Resource": "arn:aws:lambda:ap-northeast-2:032552344607:function:DumpWindows",
+            "Resource": "arn:aws:lambda:ap-northeast-2:{AccountB_id}:function:DumpWindows",
             "Parameters": {
               "instanceId.$": "$.instanceId",
               "region.$": "$.region",
@@ -72,7 +72,7 @@
           },
           "DumpLinux": {
             "Type": "Task",
-            "Resource": "arn:aws:lambda:ap-northeast-2:032552344607:function:DumpLinux",
+            "Resource": "arn:aws:lambda:ap-northeast-2:{AccountB_id}:function:DumpLinux",
             "Parameters": {
               "instanceId.$": "$.instanceId",
               "region.$": "$.region",
