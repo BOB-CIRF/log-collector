@@ -1,0 +1,40 @@
+from enum import Enum
+
+class ResourceType(Enum):
+    CLOUDTRAIL = "cloudtrail"
+    S3_ACCESS = "s3 access logs"
+    VPC = "vpc flow logs"
+    API_GW = "api gateway access log"
+    ELB = "elb"
+    CLOUDFRONT = "cloudfront"
+    CONFIG = "config"
+    RDS_AUDIT = "rds audit"
+    REDSHIFT_AUDIT = "redshift audit"
+    FSX = "fsx audit"
+    CLIENT_VPN ="client vpn"
+    ROUTE53_RESOLVER = "route53 resolver"
+    WAF = "waf"
+    EKS = "eks"
+    FW_ALERT = "network firewall alert logs"
+    FW_FLOW = "network firewall flow logs"
+    TRANSIT_GW = "transit gateway flow logs"
+    SSM = "session manager logs"
+    GLOBAL_ACCELERATOR = "global accelerator flow logs"
+
+class DestLogsType(Enum):
+    S3 = "s3"
+    CWL = "cloudwatch log group"
+    KINESIS = "kinesis data stream"
+    FIREHOSE = "kinesis firehose"
+    REDSHIFT = "redshift"
+    OPENSEARCH = "opensearch"
+    ELASTICSEARCH = "elasticsearch"
+    UNKNOWN = "unknown"
+    CT_LAKE = "cloudtrail lake"
+
+class FirehoseDestType(Enum):
+    EX_S3 = "ExtendedS3DestinationDescription"
+    S3 = "S3DestinationDescription"
+    REDSHIFT = "RedshiftDestinationDescription"
+    OPENSEARCH = "AmazonopensearchserviceDestinationDescription"
+    ELASTICSEARCH = "ElasticsearchDestinationDescription"
