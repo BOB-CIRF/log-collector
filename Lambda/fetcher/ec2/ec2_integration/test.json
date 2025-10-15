@@ -1,0 +1,16 @@
+{
+    "assumeRoleArn": "",
+    "instanceId": "",
+    "incident_id": "",
+    "targetAccountId": "",
+    "sourceAccountId": "",
+    "targetRegion": "",
+    "sourceRegion": "",
+    "targetKmsKeyId": "",
+    "targetRoleArn": "",
+    "attachInstanceId": "",
+    "attachDeviceName": "",
+    "az": ""
+}
+
+

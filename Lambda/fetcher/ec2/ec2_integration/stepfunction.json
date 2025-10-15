@@ -1,0 +1,332 @@
+{
+    "Comment": "Unified DFIR: Memory Dump (S1) + Snapshot/Copy/Attach (S2)",
+    "StartAt": "ValidateInput",
+    "States": {
+      "ValidateInput": {
+        "Type": "Choice",
+        "Comment": "Check required fields",
+        "Choices": [
+          {
+            "And": [
+              {
+                "Variable": "$.incident_id",
+                "IsPresent": true
+              },
+              {
+                "Variable": "$.instanceId",
+                "IsPresent": true
+              },
+              {
+                "Variable": "$.sourceRegion",
+                "IsPresent": true
+              },
+              {
+                "Variable": "$.targetRoleArn",
+                "IsPresent": true
+              }
+            ],
+            "Next": "PrepareS1Input"
+          }
+        ],
+        "Default": "ValidationFailed"
+      },
+      "ValidationFailed": {
+        "Type": "Fail",
+        "Error": "ValidationError",
+        "Cause": "Required fields missing: incident_id, instanceId, sourceRegion, targetRoleArn"
+      },
+      "PrepareS1Input": {
+        "Type": "Pass",
+        "Comment": "Parse unified input to S1 format",
+        "Parameters": {
+          "incident_id.$": "$.incident_id",
+          "targetRoleArn.$": "$.targetRoleArn",
+          "instances.$": "States.Array(States.JsonMerge(States.StringToJson('{}'), States.StringToJson(States.Format('\\{\"instanceId\":\"{}\",\"region\":\"{}\"\\}', $.instanceId, $.sourceRegion)), false))",
+          "_original.$": "$"
+        },
+        "ResultPath": "$.s1Context",
+        "Next": "ProcessInstances"
+      },
+      "ProcessInstances": {
+        "Type": "Map",
+        "ItemsPath": "$.s1Context.instances",
+        "MaxConcurrency": 5,
+        "ResultPath": "$.s1Results",
+        "Iterator": {
+          "StartAt": "GetFacts",
+          "States": {
+            "GetFacts": {
+              "Type": "Task",
+              "Resource": "arn:aws:lambda:ap-northeast-2:{AccountB_id}:function:GetFacts",
+              "Parameters": {
+                "instanceId.$": "$.instanceId",
+                "region.$": "$.region",
+                "targetRoleArn.$": "$$.Execution.Input.assumeRoleArn"
+              },
+              "ResultPath": "$.facts",
+              "Retry": [
+                {
+                  "ErrorEquals": [
+                    "States.ALL"
+                  ],
+                  "IntervalSeconds": 2,
+                  "MaxAttempts": 3,
+                  "BackoffRate": 2
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": [
+                    "States.ALL"
+                  ],
+                  "ResultPath": "$.factsError",
+                  "Next": "EndItem"
+                }
+              ],
+              "Next": "SSMManaged?"
+            },
+            "SSMManaged?": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.facts.ssmManaged",
+                  "BooleanEquals": true,
+                  "Next": "OSChoice"
+                }
+              ],
+              "Default": "EndItem"
+            },
+            "OSChoice": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.facts.os",
+                  "StringEquals": "windows",
+                  "Next": "DumpWindows"
+                },
+                {
+                  "Variable": "$.facts.os",
+                  "StringEquals": "linux",
+                  "Next": "DumpLinux"
+                }
+              ],
+              "Default": "EndItem"
+            },
+            "DumpWindows": {
+              "Type": "Task",
+              "Resource": "arn:aws:lambda:ap-northeast-2:{AccountB_id}:function:DumpWindows",
+              "Parameters": {
+                "instanceId.$": "$.instanceId",
+                "region.$": "$.region",
+                "incident_id.$": "$$.Execution.Input.incident_id",
+                "targetRoleArn.$": "$$.Execution.Input.assumeRoleArn",
+                "dumpDir": "C:\\forensics"
+              },
+              "ResultPath": "$.dumpResult",
+              "Catch": [
+                {
+                  "ErrorEquals": [
+                    "States.ALL"
+                  ],
+                  "ResultPath": "$.dumpError",
+                  "Next": "EndItem"
+                }
+              ],
+              "Next": "EndItem"
+            },
+            "DumpLinux": {
+              "Type": "Task",
+              "Resource": "arn:aws:lambda:ap-northeast-2:{AccountB_id}:function:DumpLinux",
+              "Parameters": {
+                "instanceId.$": "$.instanceId",
+                "region.$": "$.region",
+                "incident_id.$": "$$.Execution.Input.incident_id",
+                "targetRoleArn.$": "$$.Execution.Input.assumeRoleArn",
+                "dumpDir": "/forensics"
+              },
+              "ResultPath": "$.dumpResult",
+              "Catch": [
+                {
+                  "ErrorEquals": [
+                    "States.ALL"
+                  ],
+                  "ResultPath": "$.dumpError",
+                  "Next": "EndItem"
+                }
+              ],
+              "Next": "EndItem"
+            },
+            "EndItem": {
+              "Type": "Pass",
+              "OutputPath": "$",
+              "End": true
+            }
+          }
+        },
+        "Next": "ResolveSourceVolume"
+      },
+      "ResolveSourceVolume": {
+        "Type": "Task",
+        "Resource": "arn:aws:lambda:ap-northeast-2:{AccountB_id}:function:ResolveSrcVolss",
+        "Parameters": {
+          "assumeRoleArn.$": "$.assumeRoleArn",
+          "instanceId.$": "$.instanceId",
+          "incident_id.$": "$.incident_id"
+        },
+        "ResultPath": "$.resolvedVolume",
+        "Retry": [
+          {
+            "ErrorEquals": [
+              "ThrottlingException",
+              "ServiceUnavailableException"
+            ],
+            "IntervalSeconds": 5,
+            "MaxAttempts": 3,
+            "BackoffRate": 2
+          }
+        ],
+        "Next": "CreateSourceSnapshot"
+      },
+      "CreateSourceSnapshot": {
+        "Type": "Task",
+        "Resource": "arn:aws:lambda:ap-northeast-2:{AccountB_id}:function:CreateSrcSnapshotss",
+        "Parameters": {
+          "assumeRoleArn.$": "$.assumeRoleArn",
+          "volumeId.$": "$.resolvedVolume.volumeId",
+          "incident_id.$": "$.incident_id",
+          "sourceInstanceId.$": "$.instanceId"
+        },
+        "ResultPath": "$.snapshot",
+        "Retry": [
+          {
+            "ErrorEquals": [
+              "ThrottlingException",
+              "ServiceUnavailableException"
+            ],
+            "IntervalSeconds": 10,
+            "MaxAttempts": 6,
+            "BackoffRate": 2
+          }
+        ],
+        "Next": "WaitForSnapshot"
+      },
+      "WaitForSnapshot": {
+        "Type": "Wait",
+        "Seconds": 30,
+        "Next": "CheckSnapshotStatus"
+      },
+      "CheckSnapshotStatus": {
+        "Type": "Task",
+        "Resource": "arn:aws:lambda:ap-northeast-2:{AccountB_id}:function:CheckSnapshotStatus",
+        "Parameters": {
+          "assumeRoleArn.$": "$.assumeRoleArn",
+          "snapshotId.$": "$.snapshot.snapshotId"
+        },
+        "ResultPath": "$.snapshotStatus",
+        "Next": "IsSnapshotReady?"
+      },
+      "IsSnapshotReady?": {
+        "Type": "Choice",
+        "Choices": [
+          {
+            "Variable": "$.snapshotStatus.state",
+            "StringEquals": "completed",
+            "Next": "ShareSnapshotWithTarget"
+          }
+        ],
+        "Default": "WaitForSnapshot"
+      },
+      "ShareSnapshotWithTarget": {
+        "Type": "Task",
+        "Resource": "arn:aws:lambda:ap-northeast-2:{AccountB_id}:function:ShareSnapshotWithTarget",
+        "Parameters": {
+          "assumeRoleArn.$": "$.assumeRoleArn",
+          "snapshotId.$": "$.snapshot.snapshotId",
+          "targetAccountId.$": "$.targetAccountId"
+        },
+        "ResultPath": "$.shareResult",
+        "Next": "CopySnapshotInTarget"
+      },
+      "CopySnapshotInTarget": {
+        "Type": "Task",
+        "Resource": "arn:aws:lambda:ap-northeast-2:{AccountB_id}:function:CopySnapshotInTarget",
+        "Parameters": {
+          "assumeRoleArn.$": "$.targetRoleArn",
+          "sourceSnapshotId.$": "$.snapshot.snapshotId",
+          "sourceAccountId.$": "$.sourceAccountId",
+          "sourceRegion.$": "$.sourceRegion",
+          "incident_id.$": "$.incident_id"
+        },
+        "ResultPath": "$.copyOut",
+        "Retry": [
+          {
+            "ErrorEquals": [
+              "ThrottlingException",
+              "ServiceUnavailableException"
+            ],
+            "IntervalSeconds": 10,
+            "MaxAttempts": 6,
+            "BackoffRate": 2
+          }
+        ],
+        "Next": "WaitForVolumeAttach"
+      },
+      "WaitForVolumeAttach": {
+        "Type": "Wait",
+        "Seconds": 5,
+        "Next": "CreateVolumeAndAttach"
+      },
+      "CreateVolumeAndAttach": {
+        "Type": "Task",
+        "Resource": "arn:aws:lambda:ap-northeast-2:{AccountB_id}:function:CreateVolumeAndAttach",
+        "Parameters": {
+          "assumeRoleArn.$": "$.targetRoleArn",
+          "targetSnapshotId.$": "$.copyOut.snapshotId",
+          "az.$": "$.az",
+          "attachInstanceId.$": "$.attachInstanceId",
+          "attachDeviceName.$": "$.attachDeviceName",
+          "incident_id.$": "$.incident_id"
+        },
+        "ResultPath": "$.attachOut",
+        "Next": "IsVolumeMounted?"
+      },
+      "IsVolumeMounted?": {
+        "Type": "Choice",
+        "Choices": [
+          {
+            "Variable": "$.attachOut.attachmentState",
+            "StringEquals": "attached",
+            "Next": "MountVolumeViaSSM"
+          }
+        ],
+        "Default": "WaitForVolumeAttach"
+      },
+      "MountVolumeViaSSM": {
+        "Type": "Task",
+        "Resource": "arn:aws:lambda:ap-northeast-2:{AccountB_id}:function:MountVolumeViaSSM",
+        "Parameters": {
+          "targetRoleArn.$": "$.targetRoleArn",
+          "attachInstanceId.$": "$.attachInstanceId",
+          "attachDeviceName.$": "$.attachDeviceName",
+          "volumeId.$": "$.attachOut.volumeId",
+          "incident_id.$": "$.incident_id"
+        },
+        "Retry": [
+          {
+            "ErrorEquals": [
+              "Lambda.ServiceException",
+              "Lambda.AWSLambdaException",
+              "Lambda.SdkClientException",
+              "Lambda.TooManyRequestsException"
+            ],
+            "IntervalSeconds": 1,
+            "MaxAttempts": 3,
+            "BackoffRate": 2,
+            "JitterStrategy": "FULL"
+          }
+        ],
+        "End": true
+      }
+    },
+    "TimeoutSeconds": 7200
+  }
