@@ -1,11 +1,12 @@
+
 import os
 import json
+import gzip
 import time
 import random
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional, Dict, Any, List
-from urllib.parse import quote
 import boto3
 from botocore.exceptions import ClientError
 
@@ -15,9 +16,9 @@ logger.setLevel(logging.INFO)
 
 # ===== 환경변수 =====
 AWS_REGION = os.getenv("AWS_REGION", "ap-northeast-2")
-SOURCE_ACCOUNT_ROLE_ARN = os.getenv("SOURCE_ACCOUNT_ROLE_ARN")
+SOURCE_ACCOUNT_ROLE_ARN = os.getenv("SOURCE_ACCOUNT_ROLE_ARN", "{SOURCE_ACCOUNT_ROLE_ARN 입력}")
 BUCKET = os.getenv("BUCKET", "cirfrawtest")
-PREFIX = os.getenv("PREFIX", "cwl-pull")
+PREFIX = os.getenv("PREFIX", "cloudwatch-assume")
 CHECKPOINT_FILE = "/tmp/checkpoint.json"
 
 # ===== 재시도 로직 =====
@@ -47,28 +48,33 @@ def init_clients():
     """CloudWatch Logs 및 S3 클라이언트 초기화"""
     sts_client = boto3.client("sts", region_name=AWS_REGION)
 
-    if SOURCE_ACCOUNT_ROLE_ARN:
-        logger.info(f"Assuming role: {SOURCE_ACCOUNT_ROLE_ARN}")
-        creds = sts_client.assume_role(
-            RoleArn=SOURCE_ACCOUNT_ROLE_ARN,
-            RoleSessionName="cwl-puller-source"
-        )["Credentials"]
-        logs_client = boto3.client(
-            "logs",
-            region_name=AWS_REGION,
-            aws_access_key_id=creds["AccessKeyId"],
-            aws_secret_access_key=creds["SecretAccessKey"],
-            aws_session_token=creds["SessionToken"],
-        )
-    else:
-        logger.info("Using same-account credentials")
-        logs_client = boto3.client("logs", region_name=AWS_REGION)
+    if not SOURCE_ACCOUNT_ROLE_ARN:
+        logger.error("SOURCE_ACCOUNT_ROLE_ARN is required")
+        raise RuntimeError("SOURCE_ACCOUNT_ROLE_ARN environment variable must be set")
+
+    logger.info(f"Assuming role: {SOURCE_ACCOUNT_ROLE_ARN}")
+
+    # Role ARN에서 Account ID 추출: arn:aws:iam::ACCOUNT_ID:role/ROLE_NAME
+    acc_id = SOURCE_ACCOUNT_ROLE_ARN.split(":")[4]
+
+    creds = sts_client.assume_role(
+        RoleArn=SOURCE_ACCOUNT_ROLE_ARN,
+        RoleSessionName="cwl-puller-source"
+    )["Credentials"]
+    logs_client = boto3.client(
+        "logs",
+        region_name=AWS_REGION,
+        aws_access_key_id=creds["AccessKeyId"],
+        aws_secret_access_key=creds["SecretAccessKey"],
+        aws_session_token=creds["SessionToken"],
+    )
 
     s3_client = boto3.client("s3", region_name=AWS_REGION)
-    return logs_client, s3_client
+    return logs_client, s3_client, acc_id
 
 logs_client = None
 s3_client = None
+account_id = None
 
 # ===== 체크포인트 =====
 class Checkpoint:
@@ -134,27 +140,39 @@ def get_log_events(log_group_name: str, log_stream_name: str,
         params["nextToken"] = next_token
     return retry_call(logs_client.get_log_events, 5, 1, **params)
 
-# ===== S3 업로드 (JSON 배열, 비압축) =====
-def upload_to_s3(data: List[Dict[str, Any]], log_group: str, log_stream: str, part_id: int):
-    """로그 이벤트를 JSON 배열(.json)로 S3에 업로드 (비압축)"""
+# ===== S3 업로드 =====
+def upload_to_s3(data: List[Dict[str, Any]], log_group: str, log_stream: str, part_id: int) -> int:
+    """로그 이벤트를 JSON.GZ 형식으로 S3에 업로드"""
     if not data:
-        return
+        return 0
 
-    encoded_group = quote(log_group, safe="")
-    encoded_stream = quote(log_stream, safe="")
-    s3_key = f"{PREFIX}/region={AWS_REGION}/group={encoded_group}/stream={encoded_stream}/part-{part_id}.json"
+    # 로그 이벤트의 첫 번째 timestamp를 기준으로 날짜 추출 (밀리초 -> 초)
+    # CloudWatch 로그 이벤트 형식: {"timestamp": 1697385600000, "message": "..."}
+    first_event_timestamp = data[0].get("timestamp", int(time.time() * 1000))
+    event_date = datetime.fromtimestamp(first_event_timestamp / 1000, tz=timezone.utc).strftime("%Y-%m-%d")
 
-    json_bytes = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
+    # 파일명 생성: log_group + log_stream + part_id를 기반으로 고유한 파일명
+    # 특수문자 제거 및 정리
+    safe_group = log_group.replace("/", "_").replace(" ", "_")
+    safe_stream = log_stream.replace("/", "_").replace(" ", "_").replace("[", "").replace("]", "")
+    filename = f"{safe_group}_{safe_stream}_part{part_id}.json.gz"
+
+    # 새로운 경로 구조: cloudwatch/dt=YYYY-MM-DD/account=ACCOUNT_ID/region=REGION/filename.json.gz
+    s3_key = f"{PREFIX}/dt={event_date}/account={account_id}/region={AWS_REGION}/{filename}"
+
+    json_content = json.dumps(data, ensure_ascii=False, indent=2)
+    compressed = gzip.compress(json_content.encode("utf-8"))
 
     try:
         s3_client.put_object(
             Bucket=BUCKET,
             Key=s3_key,
-            Body=json_bytes,
+            Body=compressed,
             ContentType="application/json",
+            ContentEncoding="gzip",
             ServerSideEncryption="AES256",
         )
-        logger.info(f"✓ Uploaded s3://{BUCKET}/{s3_key} ({len(data)} events, {len(json_bytes)} bytes)")
+        return len(compressed)
     except ClientError as e:
         logger.error(f"✗ S3 upload failed for {s3_key}: {e}")
         raise
@@ -162,62 +180,76 @@ def upload_to_s3(data: List[Dict[str, Any]], log_group: str, log_stream: str, pa
 # ===== 처리 로직 =====
 def process_log_stream(log_group: str, log_stream: str,
                        start_time: Optional[int], end_time: Optional[int],
-                       checkpoint: Checkpoint, buffer_size: int = 10000):
-    """단일 로그 스트림 처리 (디버깅 로그 포함)"""
+                       checkpoint: Checkpoint, buffer_size: int = 50000) -> Dict[str, int]:
+    """단일 로그 스트림 처리 (통계 반환)"""
     state = checkpoint.get(log_group, log_stream)
     if state and state.get("completed"):
         logger.info(f"Skipping completed stream: {log_group}/{log_stream}")
-        return
+        return {"events": 0, "bytes": 0}
 
     next_token = state.get("nextToken") if state else None
     part_id = state.get("partId", 0) if state else 0
     buffer: List[Dict[str, Any]] = []
     total_events = 0
+    total_bytes = 0
 
-    logger.info(f"Processing stream: {log_group}/{log_stream}")
-    logger.info(f"Time range: {start_time} ~ {end_time}")
-
+    prev_token = None
     while True:
         resp = get_log_events(log_group, log_stream, start_time, end_time, next_token)
         events = resp.get("events", [])
         forward_token = resp.get("nextForwardToken")
-        
-        total_events += len(events)
-        logger.info(f"Fetched {len(events)} events (total: {total_events})")
+
+        # 더 이상 새로운 이벤트가 없으면 종료
+        if not events and forward_token == next_token:
+            break
 
         if events:
+            total_events += len(events)
             buffer.extend(events)
+
             if len(buffer) >= buffer_size:
-                upload_to_s3(buffer, log_group, log_stream, part_id)
+                uploaded_bytes = upload_to_s3(buffer, log_group, log_stream, part_id)
+                total_bytes += uploaded_bytes
                 part_id += 1
                 buffer = []
                 checkpoint.set(log_group, log_stream, {"nextToken": forward_token, "partId": part_id})
 
-        if forward_token == next_token:
+        # 토큰이 변경되지 않으면 종료 (페이지네이션 끝)
+        if forward_token == prev_token or forward_token == next_token:
             break
+
+        prev_token = next_token
         next_token = forward_token
 
     # 남은 버퍼 flush
     if buffer:
-        logger.info(f"Flushing remaining {len(buffer)} events")
-        upload_to_s3(buffer, log_group, log_stream, part_id)
+        uploaded_bytes = upload_to_s3(buffer, log_group, log_stream, part_id)
+        total_bytes += uploaded_bytes
         part_id += 1
-    else:
-        logger.warning(f"No events to upload for {log_group}/{log_stream}")
 
     checkpoint.set(log_group, log_stream, {"completed": True, "partId": part_id})
-    logger.info(f"✓ Completed stream: {log_group}/{log_stream} ({part_id} parts, {total_events} total events)")
 
-def process_log_group(log_group: str, start_time: Optional[int], end_time: Optional[int], checkpoint: Checkpoint):
-    """단일 로그 그룹의 모든 스트림 처리"""
+    if total_events > 0:
+        logger.info(f"✓ Completed: {log_stream} ({total_events} events)")
+
+    return {"events": total_events, "bytes": total_bytes}
+
+def process_log_group(log_group: str, start_time: Optional[int], end_time: Optional[int], checkpoint: Checkpoint) -> Dict[str, int]:
+    """단일 로그 그룹의 모든 스트림 처리 (통계 반환)"""
     logger.info(f"Processing log group: {log_group}")
     next_token = None
+    total_streams = 0
+    total_events = 0
+    total_bytes = 0
 
     while True:
         try:
             resp = describe_log_streams(log_group, next_token)
             for s in resp.get("logStreams", []):
-                process_log_stream(log_group, s["logStreamName"], start_time, end_time, checkpoint)
+                stats = process_log_stream(log_group, s["logStreamName"], start_time, end_time, checkpoint)
+                total_streams += 1
+                total_events += stats["events"]
+                total_bytes += stats["bytes"]
 
             next_token = resp.get("nextToken")
             if not next_token:
@@ -228,11 +260,16 @@ def process_log_group(log_group: str, start_time: Optional[int], end_time: Optio
                 break
             raise
 
+    return {"streams": total_streams, "events": total_events, "bytes": total_bytes}
+
 def run_pull(log_group_prefix: Optional[str], start_time_ms: Optional[int], end_time_ms: Optional[int]):
     """모든 로그 그룹 스캔 및 처리"""
     checkpoint = Checkpoint(CHECKPOINT_FILE)
     next_token = None
     processed_groups = 0
+    total_streams = 0
+    total_events = 0
+    total_bytes = 0
 
     logger.info(f"Starting pull - prefix: {log_group_prefix}, time: {start_time_ms} ~ {end_time_ms}")
 
@@ -243,43 +280,31 @@ def run_pull(log_group_prefix: Optional[str], start_time_ms: Optional[int], end_
             if log_group_prefix and not name.startswith(log_group_prefix):
                 continue
 
-            process_log_group(name, start_time_ms, end_time_ms, checkpoint)
+            stats = process_log_group(name, start_time_ms, end_time_ms, checkpoint)
             processed_groups += 1
+            total_streams += stats["streams"]
+            total_events += stats["events"]
+            total_bytes += stats["bytes"]
 
         next_token = resp.get("nextToken")
         if not next_token:
             break
 
-    logger.info(f"✓ Pull completed: {processed_groups} log groups processed")
+    # 통계 출력
+    size_mb = total_bytes / (1024 * 1024)
+    size_gb = total_bytes / (1024 * 1024 * 1024)
 
-# ===== 필터 헬퍼 =====
-def _has_cloudwatch_dest(event: dict, payload: dict) -> bool:
-    """SNS MessageAttributes 또는 payload에서 logDestType=cloudwatch 확인"""
-    try:
-        if "Records" in event and event["Records"] and "Sns" in event["Records"][0]:
-            attrs = event["Records"][0]["Sns"].get("MessageAttributes", {}) or {}
-            if "logDestType" in attrs:
-                attr = attrs["logDestType"]
-                if attr.get("Type") == "String.Array":
-                    arr = json.loads(attr.get("Value") or "[]")
-                    return any(str(v).lower() == "cloudwatch" for v in arr)
-                if attr.get("Type") == "String":
-                    return str(attr.get("Value", "")).lower() == "cloudwatch"
-    except Exception as e:
-        logger.warning(f"Failed to parse MessageAttributes: {e}")
+    if size_gb >= 1:
+        size_str = f"{size_gb:.2f} GB"
+    else:
+        size_str = f"{size_mb:.2f} MB"
 
-    vals = payload.get("logDestType")
-    if isinstance(vals, list):
-        return any(str(v).lower() == "cloudwatch" for v in vals)
-    if isinstance(vals, str):
-        return vals.lower() == "cloudwatch"
-
-    return False
+    logger.info(f"✓ Pull completed: {processed_groups} log groups, {total_streams} log streams, {total_events} events, {size_str} uploaded")
 
 # ===== Lambda Handler =====
 def lambda_handler(event, context):
     """Lambda 핸들러"""
-    global logs_client, s3_client
+    global logs_client, s3_client, account_id
 
     logger.info(f"Lambda invoked - Remaining time: {context.get_remaining_time_in_millis() / 1000:.1f}s")
 
@@ -300,10 +325,6 @@ def lambda_handler(event, context):
         payload = event if isinstance(event, dict) else {}
         logger.info(f"Direct invocation payload: {json.dumps(payload, ensure_ascii=False)}")
 
-    if not _has_cloudwatch_dest(event, payload):
-        logger.info("Skipping: logDestType != cloudwatch")
-        return {"status": "skipped", "reason": "logDestType != cloudwatch"}
-
     start_sec = payload.get("start_time")
     end_sec = payload.get("end_time")
     log_group_prefix = payload.get("log_group_prefix")
@@ -311,7 +332,7 @@ def lambda_handler(event, context):
     end_time = int(end_sec) * 1000 if end_sec else None
 
     try:
-        logs_client, s3_client = init_clients()
+        logs_client, s3_client, account_id = init_clients()
         run_pull(log_group_prefix, start_time, end_time)
 
         logger.info("✓ Lambda execution completed successfully")
